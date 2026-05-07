@@ -8,11 +8,16 @@ import { Label } from "@/components/ui/label";
 import { Badge } from "@/components/ui/badge";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Progress } from "@/components/ui/progress";
-import { UploadCloud, CheckCircle2, AlertTriangle, FileSearch, ArrowRight, Printer, AlertCircle, Loader2, BrainCircuit } from "lucide-react";
+import { UploadCloud, CheckCircle2, AlertTriangle, FileSearch, ArrowRight, Printer, AlertCircle, Loader2, BrainCircuit, Save } from "lucide-react";
 import { useDropzone } from "react-dropzone";
 import { GoogleGenAI, Type } from "@google/genai";
 import { motion, AnimatePresence } from "motion/react";
 import { cn } from "@/lib/utils";
+import Image from "next/image";
+import { DocumentViewer } from "@/components/ui/DocumentViewer";
+import { db } from "@/lib/firebase";
+import { collection, addDoc, serverTimestamp } from "firebase/firestore";
+import { useAuth } from "@/components/FirebaseProvider";
 
 const steps = [
   "Upload",
@@ -25,15 +30,18 @@ const steps = [
 // ... (fileToBase64 remains same)
 
 export default function NewShipmentFlow({ onCancel }: { onCancel: () => void }) {
+  const { user } = useAuth();
   const [currentStep, setCurrentStep] = useState(0);
   const [file, setFile] = useState<File | null>(null);
   const [extractedData, setExtractedData] = useState<any>(null);
   const [complianceResult, setComplianceResult] = useState<any>(null);
   const [isProcessing, setIsProcessing] = useState(false);
+  const [isSaving, setIsSaving] = useState(false);
   const [terminalLogs, setTerminalLogs] = useState<string[]>([]);
   const scrollRef = useRef<HTMLDivElement>(null);
 
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [saveSuccess, setSaveSuccess] = useState(false);
 
   const addLog = (log: string) => {
     setTerminalLogs((prev) => [...prev, log]);
@@ -44,7 +52,21 @@ export default function NewShipmentFlow({ onCancel }: { onCancel: () => void }) 
     }, 100);
   };
 
-  // ... (useDropzone remains same)
+  const { getRootProps, getInputProps, isDragActive } = useDropzone({
+    accept: {
+      'application/pdf': ['.pdf'],
+      'image/jpeg': ['.jpg', '.jpeg'],
+      'image/png': ['.png']
+    },
+    maxFiles: 1,
+    onDrop: (acceptedFiles) => {
+      if (acceptedFiles.length > 0) {
+        setFile(acceptedFiles[0]);
+        setExtractedData(null);
+        setComplianceResult(null);
+      }
+    }
+  });
 
   const runExtraction = async () => {
     if (!file) return;
@@ -57,7 +79,7 @@ export default function NewShipmentFlow({ onCancel }: { onCancel: () => void }) 
       const ai = new GoogleGenAI({ apiKey: process.env.NEXT_PUBLIC_GEMINI_API_KEY as string });
       
       const response = await ai.models.generateContent({
-        model: "gemini-3.1-flash-lite-preview",
+        model: "gemini-2.5-pro",
         contents: {
           parts: [
             { inlineData: { data: base64, mimeType } },
@@ -65,8 +87,9 @@ export default function NewShipmentFlow({ onCancel }: { onCancel: () => void }) 
           ]
         },
         config: {
+          temperature: 0.0,
           responseMimeType: "application/json",
-          systemInstruction: "You are an AI extracting data from an invoice or bill of lading. Be extremely precise.",
+          systemInstruction: "You are an enterprise-grade AI extracting data from an invoice or bill of lading for legal customs processing. 1. If a value is missing, return 'NOT_FOUND'. 2. Do NOT guess or infer any values not explicitly printed on the document. 3. Accuracy is critical to avoid severe legal penalties for the user.",
           responseSchema: {
             type: Type.OBJECT,
             properties: {
@@ -75,10 +98,11 @@ export default function NewShipmentFlow({ onCancel }: { onCancel: () => void }) 
               invoiceNum: { type: Type.STRING },
               hsCode: { type: Type.STRING },
               origin: { type: Type.STRING },
+              destination: { type: Type.STRING, description: "City and Country of the importer or final delivery" },
               incoterm: { type: Type.STRING },
               value: { type: Type.STRING },
               currency: { type: Type.STRING },
-              confidence: { type: Type.NUMBER, description: "0-100 overall confidence" }
+              confidence: { type: Type.NUMBER, description: "0-100 overall confidence based on document clarity and completeness" }
             }
           }
         }
@@ -116,16 +140,17 @@ export default function NewShipmentFlow({ onCancel }: { onCancel: () => void }) 
       const ai = new GoogleGenAI({ apiKey: process.env.NEXT_PUBLIC_GEMINI_API_KEY as string });
       
       const response = await ai.models.generateContent({
-        model: "gemini-3.1-pro-preview",
-        contents: `Validate the following extracted shipping data against trade compliance rules.
+        model: "gemini-2.5-pro",
+        contents: `Validate the following extracted shipping data against international trade compliance laws (UN sanctions, AfCFTA, HS Code mismatch, entity watchlists).
         Data: ${JSON.stringify(extractedData)}`,
         config: {
+          temperature: 0.1,
           responseMimeType: "application/json",
-          systemInstruction: "You are a trade compliance analyzer estimating risk and penalties. Output JSON.",
+          systemInstruction: "You are the Chief Compliance Officer for an international logistics firm. You must provide a rigorously accurate risk assessment and compliance review of the shipment data. 1. Base your analysis STRICTLY on established global trade laws and the provided data. 2. Flag specific discrepancies, high-risk jurisdictions, missing data, and entity risks. 3. Do not invent or hallucinate issues if none exist. Output valid JSON.",
           responseSchema: {
             type: Type.OBJECT,
             properties: {
-              riskScore: { type: Type.NUMBER, description: "0 to 100" },
+              riskScore: { type: Type.NUMBER, description: "0 to 100 representing compliance risk" },
               penaltyEstimate: { type: Type.NUMBER },
               issues: {
                 type: Type.ARRAY,
@@ -159,6 +184,40 @@ export default function NewShipmentFlow({ onCancel }: { onCancel: () => void }) 
       setCurrentStep(1); 
     } finally {
       setIsProcessing(false);
+    }
+  };
+
+  const saveShipment = async () => {
+    if (!user || !extractedData || !complianceResult) return;
+    setIsSaving(true);
+    try {
+        const score = complianceResult.riskScore || 0;
+        
+        const shipmentData = {
+        userId: user.uid,
+        externalId: extractedData.invoiceNum || `SHP-${Math.floor(Math.random() * 10000)}`,
+        exporter: extractedData.exporter,
+        importer: extractedData.importer,
+        hsCode: extractedData.hsCode || "",
+        origin: extractedData.origin || "",
+        destination: extractedData.destination || "Lagos, NG",
+        totalValue: parseFloat(extractedData.value?.replace(/[^0-9.-]+/g, "") || "0"),
+        currency: extractedData.currency || "USD",
+        riskScore: score,
+        status: score > 80 ? "High Risk" : score >= 50 ? "Under Review" : "Cleared",
+        issues: complianceResult.issues || [],
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      };
+
+      await addDoc(collection(db, "shipments"), shipmentData);
+      setSaveSuccess(true);
+      setCurrentStep(4);
+    } catch (err) {
+      console.error("Error saving shipment:", err);
+      setErrorMessage("Failed to securely save shipment to Firestore.");
+    } finally {
+      setIsSaving(false);
     }
   };
 
@@ -221,15 +280,8 @@ export default function NewShipmentFlow({ onCancel }: { onCancel: () => void }) 
         <CardHeader>
           <CardTitle className="text-lg font-bold">Source Document</CardTitle>
         </CardHeader>
-        <CardContent className="flex items-center justify-center h-[500px] overflow-hidden p-0 rounded-b-xl border-t bg-slate-900/40">
-          {file && file.type.includes("image") ? (
-            <img src={URL.createObjectURL(file)} alt="preview" className="max-h-full max-w-full object-contain" />
-          ) : (
-            <div className="text-muted-foreground flex flex-col items-center">
-              <FileSearch className="h-14 w-14 mb-4 text-primary/30" />
-              <span className="text-sm font-bold uppercase tracking-widest opacity-50">{file?.name || "Document"}</span>
-            </div>
-          )}
+        <CardContent className="flex items-center justify-center flex-1 h-[500px] overflow-hidden p-0 rounded-b-xl border-t relative">
+          <DocumentViewer file={file} className="bg-slate-900/40" />
         </CardContent>
       </Card>
       
@@ -241,7 +293,7 @@ export default function NewShipmentFlow({ onCancel }: { onCancel: () => void }) 
           <div className="flex justify-between items-center">
             <CardTitle className="text-lg flex items-center font-bold">
               <div className="h-2 w-2 rounded-full bg-success mr-3 animate-pulse" />
-              Normix Structured Data
+              Sentrix Structured Data
             </CardTitle>
             {extractedData?.confidence && extractedData.confidence < 90 && (
               <Badge variant="warning" className="rounded-full font-bold px-3">Review Needed ({extractedData?.confidence}%)</Badge>
@@ -279,6 +331,7 @@ export default function NewShipmentFlow({ onCancel }: { onCancel: () => void }) 
                    { label: "Importer", value: extractedData.importer },
                    { label: "Invoice #", value: extractedData.invoiceNum, mono: true },
                    { label: "Origin", value: extractedData.origin, short: true },
+                   { label: "Destination", value: extractedData.destination, short: true },
                    { label: "Value", value: extractedData.value, mono: true, short: true },
                    { label: "Currency", value: extractedData.currency, short: true },
                  ].map((field, i) => (
@@ -315,7 +368,7 @@ export default function NewShipmentFlow({ onCancel }: { onCancel: () => void }) 
           <div className="w-3 h-3 rounded-full bg-warning/60"></div>
           <div className="w-3 h-3 rounded-full bg-success/60"></div>
           <div className="flex-1 text-center">
-            <span className="text-[10px] text-muted-foreground/50 font-mono uppercase tracking-[0.2em] font-black">normix-core::node_8471</span>
+            <span className="text-[10px] text-muted-foreground/50 font-mono uppercase tracking-[0.2em] font-black">sentrix-core::node_8471</span>
           </div>
         </div>
         <CardContent className="p-8 h-[400px] overflow-y-auto font-mono text-xs md:text-sm scroll-smooth leading-relaxed" ref={scrollRef}>
@@ -359,7 +412,7 @@ export default function NewShipmentFlow({ onCancel }: { onCancel: () => void }) 
     }
     
     const rs = complianceResult?.riskScore || 0;
-    const isHighRisk = rs > 50;
+    const isHighRisk = rs > 80;
     
     return (
       <div className="grid md:grid-cols-2 gap-10 max-w-6xl mx-auto py-4">
@@ -430,8 +483,9 @@ export default function NewShipmentFlow({ onCancel }: { onCancel: () => void }) 
                </motion.div>
             ))}
           </div>
-          <Button onClick={() => setCurrentStep(4)} size="lg" className="h-16 rounded-2xl font-black text-lg mt-4 shadow-xl shadow-primary/20">
-            Generate Final Report (PDF)
+          <Button onClick={saveShipment} disabled={isProcessing || isSaving || !extractedData} size="lg" className="h-16 rounded-2xl font-black text-lg mt-4 shadow-xl shadow-primary/20">
+            {isSaving ? <Loader2 className="mr-2 h-5 w-5 animate-spin" /> : <Save className="mr-2 h-5 w-5" />}
+            {isSaving ? "Saving to Secure Ledger..." : "Finalize & Generate Report"}
           </Button>
         </motion.div>
       </div>
@@ -451,10 +505,10 @@ export default function NewShipmentFlow({ onCancel }: { onCancel: () => void }) 
       </div>
       
       <div className="grid grid-cols-1 md:grid-cols-2 gap-6 w-full mt-10">
-        <Button size="xl" className="w-full text-lg font-bold py-8 rounded-3xl shadow-2xl shadow-primary/25">
+        <Button size="lg" className="w-full text-lg font-bold py-8 rounded-3xl shadow-2xl shadow-primary/25">
           <Printer className="mr-3 w-6 h-6 outline-none" /> Download Customs Defense
         </Button>
-        <Button size="xl" variant="outline" className="w-full text-lg font-bold py-8 rounded-3xl border-2 border-primary/20 hover:bg-primary/5">
+        <Button size="lg" variant="outline" className="w-full text-lg font-bold py-8 rounded-3xl border-2 border-primary/20 hover:bg-primary/5">
           Submit to Human Audit
         </Button>
       </div>

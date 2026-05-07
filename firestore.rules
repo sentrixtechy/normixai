@@ -1,0 +1,86 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // 0. Default Deny
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // --- Primitives & Helpers ---
+    function isSignedIn() { return request.auth != null; }
+    function isOwner(userId) { return isSignedIn() && request.auth.uid == userId; }
+    function incoming() { return request.resource.data; }
+    function existing() { return resource.data; }
+    function isValidId(id) { return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$'); }
+    function verifiedEmail() { return isSignedIn() && request.auth.token.email_verified == true; }
+
+    // --- Entity Validations ---
+
+    function isValidUser(data) {
+      return data.keys().hasAll(['uid', 'email'])
+          && data.uid == request.auth.uid
+          && data.email is string && data.email.size() <= 128
+          && (data.get('displayName', '') is string && data.get('displayName', '').size() <= 100)
+          && (data.get('exporterName', '') is string && data.get('exporterName', '').size() <= 100)
+          && (data.get('tin', '') is string && data.get('tin', '').size() <= 50)
+          && (data.get('address', '') is string && data.get('address', '').size() <= 200);
+    }
+
+    function isValidShipment(data) {
+      return data.keys().hasAll(['userId', 'externalId', 'origin', 'destination', 'createdAt', 'updatedAt'])
+          && data.userId == request.auth.uid
+          && data.externalId is string && data.externalId.size() <= 50
+          && data.origin is string && data.origin.size() <= 100
+          && data.destination is string && data.destination.size() <= 100
+          && (data.get('exporter', '') is string && data.get('exporter', '').size() <= 100)
+          && (data.get('importer', '') is string && data.get('importer', '').size() <= 100)
+          && (data.get('hsCode', '') is string && data.get('hsCode', '').size() <= 50)
+          && (data.get('currency', 'USD') is string && data.get('currency', '').size() <= 10)
+          && (data.get('totalValue', 0) is number)
+          && (data.get('riskScore', 0) is number)
+          && (data.get('status', 'Cleared') is string && data.get('status', '').size() <= 50)
+          && (data.get('issues', []) is list)
+          && data.createdAt == request.time
+          && data.updatedAt == request.time;
+    }
+
+    function isValidAlert(data) {
+       return data.keys().hasAll(['shipmentId', 'userId', 'type', 'message'])
+          && data.userId == request.auth.uid
+          && data.shipmentId is string && data.shipmentId.size() <= 128
+          && data.type in ['Critical', 'Warning', 'Audit']
+          && data.message is string && data.message.size() <= 500;
+    }
+
+    // --- Match Blocks ---
+
+    match /users/{userId} {
+      allow get: if isOwner(userId);
+      allow create: if isOwner(userId) && isValidUser(incoming());
+      allow update: if isOwner(userId) && isValidUser(incoming())
+                       && incoming().uid == existing().uid
+                       && incoming().email == existing().email;
+      // No delete, profiles are persistent
+    }
+
+    match /shipments/{shipmentId} {
+      allow list: if isSignedIn() && resource.data.userId == request.auth.uid;
+      allow get: if isSignedIn() && resource.data.userId == request.auth.uid;
+      allow create: if isSignedIn() && isValidId(shipmentId) && isValidShipment(incoming());
+      allow update: if isSignedIn() && resource.data.userId == request.auth.uid 
+                      && isValidShipment(incoming())
+                      && incoming().userId == existing().userId
+                      && incoming().createdAt == existing().createdAt
+                      && incoming().updatedAt == request.time;
+      allow delete: if isSignedIn() && resource.data.userId == request.auth.uid;
+    }
+
+    match /compliance_alerts/{alertId} {
+      allow list: if isSignedIn() && resource.data.userId == request.auth.uid;
+      allow get: if isSignedIn() && resource.data.userId == request.auth.uid;
+      allow create: if isSignedIn() && isValidId(alertId) && isValidAlert(incoming());
+      // No updates to alerts via client, they are engine generated
+      allow delete: if false; // Persistent record
+    }
+  }
+}
